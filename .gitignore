@@ -1,3 +1,6 @@
 invest-python/
 mydata.py
 *.log
+test_tgbot.py
+trobot.drawio
+tests/

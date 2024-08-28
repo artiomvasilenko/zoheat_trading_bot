@@ -22,7 +22,19 @@ from telegram.ext import (
 from peewee import *
 from tinkoff.invest import Client
 from tinkoff.invest.exceptions import RequestError
-from find_instrument import find_instrument
+import uuid
+from tinkoff.invest.utils import quotation_to_decimal, decimal_to_quotation
+from decimal import Decimal
+
+# Текущий статус заявки (поручения)
+execution_report_status = {
+    0: None,
+    1: 'Исполнена',
+    2: 'Отклонена',
+    3: 'Отменена пользователем',
+    4: 'Новая',
+    5: 'Частично исполнена',
+}
 
 
 # Токен вашего бота
@@ -61,18 +73,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'Для начала отправь мне API ключ Тинькофф Инвестиций.'
             )
         return Q1_TOKEN
-
+    
+def find_instrument(query):
+    '''Ищет инстументы по тикеру
+    Возвращает объект с инструментами либо пустой массив [] если ничего не найдено
+    '''
+    with Client(mydata.TOKEN) as client:
+        return client.instruments.find_instrument(query=query, api_trade_available_flag=True, instrument_kind=2) 
 
 # Обработчик текстовых сообщений
 async def text_from_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     
     if check_token_in_base(update.message.from_user.id):
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id, 
-            text=f'Привет, {update.message.chat.first_name}. Your message {user_message}'
-            )
-        
+        instruments = find_instrument(user_message.upper())
+        if instruments.instruments == []:
+            await update.message.reply_text(f'По запросу "{user_message}" ничего не найдено.')
+        else:
+            keyboard = [[InlineKeyboardButton(f'{ins.name}', callback_data='text_from_user' + ins.uid)] for ins in instruments.instruments]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text('По запросу найдены следующие акции. Выбери каким торговать: ', reply_markup=reply_markup)       
 
 
 
@@ -111,8 +132,8 @@ def get_accounts(token):
             return result
         except RequestError as e:
             print(e.details, mydata.errors[e.details]) if e.details in mydata.errors else print(e.details, e.metadata.message)
-    
-    
+
+   
 async def choose_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     '''Функция выбора аккаунта для торговли и занесение номера аккаунта в БД'''
     user_id = update.message.from_user.id
@@ -120,9 +141,11 @@ async def choose_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = user.token
     accounts = get_accounts(token)
     # создание клавиатуры
-    keyboard = [
-        [InlineKeyboardButton(f'{acc.name} - {acc.id}', callback_data=acc.id) for acc in accounts.accounts if acc.access_level == 1],
-    ]
+    keyboard = [[
+        InlineKeyboardButton(
+            f'{acc.name} - {acc.id}', callback_data='choose_account_' + acc.id)] 
+                for acc in accounts.accounts if acc.access_level == 1
+                ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Выбери аккаунт: ', reply_markup=reply_markup)
     
@@ -130,9 +153,179 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     '''Функция обработки выбора аккаунта choose_account'''
     query = update.callback_query
     await query.answer()
-    await save_choosed_account_to_bd(query.from_user.id, query.data)
-    await query.edit_message_text(text=f'Аккаунт {query.data} сохранен!')  
     
+    if query.data.startswith('choose_account_'):
+        data = query.data.replace('choose_account_', '')
+        await save_choosed_account_to_bd(query.from_user.id, data)
+        await query.edit_message_text(text=f'Аккаунт {data} сохранен!') 
+         
+    if query.data.startswith('text_from_user'):
+        data = query.data.replace('text_from_user', '')
+        await query.edit_message_text(text=f'Выставляю ордер...')
+        result = post_order(user_id=query.from_user.id, instrument_uid=data)
+        if result.execution_report_status == 1:
+            await query.edit_message_text(text=
+                f'ОРДЕР ВЫСТАВЛЕН!\n'
+                f'Биржевой идентификатор заявки: {result.order_id}\n'
+                f'Запрошено лотов: {result.lots_requested}\n'
+                f'Исполнено лотов: {result.lots_executed}\n'
+                f'Исполненная средняя цена одного инструмента в заявке: '
+                    f'{round(quotation_to_decimal(result.executed_order_price), 2)} руб.\n'
+                f'Итоговая стоимость заявки: '
+                    f'{round(quotation_to_decimal(result.total_order_amount))} руб.\n'
+                f'Текущий статус заявки: {execution_report_status[result.execution_report_status]}\n'
+                f'Дополнительные данные об исполнении заявки: {result.message}\n'
+                )
+            sl = post_stop_loss(query.from_user.id, data)
+            if sl['stop_order_id']:
+                await context.bot.send_message(
+                    chat_id=update.callback_query.from_user.id,
+                    text=f'Заявка Stop Loss успешно выставлена.\n'
+                        f'Цена заявки Stop Loss: {round(sl["calculated_price"], 2)}\n'
+                        f'Идентификатор заявки: {sl["stop_order_id"]}.'
+                    )
+            else:
+                await context.bot.send_message(
+                    chat_id=update.callback_query.from_user.id,
+                    text='При выставлении заявки произошла ошибка.'
+                    )
+            tp = post_take_profit(query.from_user.id, data)
+            if tp['stop_order_id']:
+                await context.bot.send_message(
+                    chat_id=update.callback_query.from_user.id,
+                    text=f'Заявка Take Profit успешно выставлена.\n'
+                        f'Цена заявки Take Profit: {round(tp["calculated_price"], 2)}\n'
+                        f'Идентификатор заявки: {tp["stop_order_id"]}.'
+                    )
+            else:
+                await context.bot.send_message(
+                    chat_id=update.callback_query.from_user.id,
+                    text='При выставлении заявки произошла ошибка.'
+                    ) 
+        else:
+            await query.edit_message_text(
+                text=f'ОРДЕР НЕ ВЫСТАВЛЕН'
+                f'Биржевой идентификатор заявки: {result.order_id}\n'
+                f'Текущий статус заявки: {result.execution_report_status}\n'
+                f'Дополнительные данные об исполнении заявки: {result.message}\n'
+                )
+            
+def post_order(user_id, instrument_uid):
+    '''
+    Функция выставляет ордер.
+    Принимает значения:
+        user_id - для выставления ордера согласно данных из БД
+        instrument_id - для выставления ордера согласно запросу
+    Возвращает результат ордера
+    '''
+    user = Tinkoff_invest_tokens.get(Tinkoff_invest_tokens.user_id == user_id)
+    with Client(user.token) as client:
+        order = client.orders.post_order(
+            instrument_id=instrument_uid,
+            quantity=user.quatation,       # кол-во лотов
+            direction=1,                     # 1 - покупка, 2 - продажа
+            account_id=user.account,
+            order_type=2,       # 1 - limit, 2 - market, 3 - bestprice
+            order_id=uuid.uuid4().hex
+            )
+        return order
+    
+def post_stop_loss(user_id, instrument_uid):
+    '''
+    Функция выставляет стоп лос по заявке
+    Принимает значения:
+        user_id - для выставления ордера согласно данных из БД
+        instrument_id - для выставления ордера согласно запросу
+        
+    Возвращает результат заявки
+    '''
+    # получаем данные юзера из БД
+    user = Tinkoff_invest_tokens.get(Tinkoff_invest_tokens.user_id == user_id)
+    result = {}
+    with Client(user.token) as client:
+        # получение последней стоимости инструмента
+        last_price = client.market_data.get_last_prices(
+            instrument_id=[instrument_uid]).last_prices[0].price
+        # перевод в decimal
+        last_price = quotation_to_decimal(last_price)
+        # расчёт цены с тп
+        calculated_price = last_price - last_price * Decimal(user.sl / 100)
+        result['calculated_price'] = calculated_price
+        # получение минимального шага цены
+        min_price_increment = client.instruments.get_instrument_by(
+            id_type=3,
+            id=instrument_uid
+            ).instrument.min_price_increment
+        # а вот ниже строка вообще не нужна похоже
+        #number_digits_after_point = 9 - len(str(min_price_increment.nano)) + 1
+        min_price_increment = quotation_to_decimal(min_price_increment)
+        # расчет цены для инструмента, которая равна 
+        # кратному минимальному шагу цены
+        calculated_price = (
+            round(calculated_price / min_price_increment) * min_price_increment
+        )
+        # выставляем ордер
+        result['stop_order_id'] = client.stop_orders.post_stop_order(
+            instrument_id=instrument_uid,
+            quantity=user.quatation,
+            price=decimal_to_quotation(Decimal(calculated_price)),
+            stop_price=decimal_to_quotation(Decimal(calculated_price)),
+            direction=2, # 1-buy, 2-sell
+            account_id=user.account,
+            stop_order_type=2,      # 1-tp, 2-sl, 3-slimit
+            expiration_type=1,  # 1-до отмены, 2-до даты
+            ).stop_order_id
+        return result
+    
+def post_take_profit(user_id, instrument_uid):
+    '''
+    Функция выставляет стоп лос по заявке
+    Принимает значения:
+        user_id - для выставления ордера согласно данных из БД
+        instrument_id - для выставления ордера согласно запросу
+        
+    Возвращает результат заявки
+    '''
+    # получаем данные юзера из БД
+    user = Tinkoff_invest_tokens.get(Tinkoff_invest_tokens.user_id == user_id)
+    result = {}
+    
+    with Client(user.token) as client:
+        # получение последней стоимости инструмента
+        last_price = client.market_data.get_last_prices(
+            instrument_id=[instrument_uid]).last_prices[0].price
+        # перевод в decimal
+        last_price = quotation_to_decimal(last_price)
+        # расчёт цены с тп
+        calculated_price = last_price + last_price * Decimal(user.tp / 100)
+        result['calculated_price'] = calculated_price
+        # получение минимального шага цены
+        min_price_increment = client.instruments.get_instrument_by(
+            id_type=3,
+            id=instrument_uid
+            ).instrument.min_price_increment
+        # а вот ниже строка вообще не нужна похоже
+        #number_digits_after_point = 9 - len(str(min_price_increment.nano)) + 1
+        min_price_increment = quotation_to_decimal(min_price_increment)
+        # расчет цены для инструмента, которая равна 
+        # кратному минимальному шагу цены
+        calculated_price = (
+            round(calculated_price / min_price_increment) * min_price_increment
+        )
+        # выставляем ордер
+        result['stop_order_id'] = client.stop_orders.post_stop_order(
+            instrument_id=instrument_uid,
+            quantity=user.quatation,
+            price=decimal_to_quotation(Decimal(calculated_price)),
+            stop_price=decimal_to_quotation(Decimal(calculated_price)),
+            direction=2, # 1-buy, 2-sell
+            account_id=user.account,
+            stop_order_type=1,      # 1-tp, 2-sl, 3-slimit
+            expiration_type=1,  # 1-до отмены, 2-до даты
+            ).stop_order_id
+        return result
+
+           
 
 # Обработчик ошибок
 async def error(update: Update, context: CallbackContext):
@@ -218,7 +411,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_choice))
     app.add_handler(CommandHandler('delete_keyboard', delete_keyboard))
     app.add_handler(CommandHandler('choose_account', choose_account))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    #app.run_polling(allowed_updates=Update.ALL_TYPES) # для выполнения данных, когда пришли команды когда бот отключен
+    app.run_polling()
 
     db.close()
 
