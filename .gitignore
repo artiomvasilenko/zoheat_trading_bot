@@ -4,3 +4,5 @@ mydata.py
 test_tgbot.py
 trobot.drawio
 tests/
+api_key_tg.py
+tdata.db
